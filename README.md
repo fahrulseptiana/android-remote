@@ -35,7 +35,9 @@ cd android
 The APK is written to
 `android/app/build/outputs/apk/debug/app-debug.apk`. Gradle's `cargoBuild` task
 compiles the Rust library with `cargo-ndk` and packages the resulting `.so`
-files as JNI libraries.
+files as JNI libraries. The `scrcpyServer` task builds `scrcpy-server` from the
+pinned `third_party/scrcpy` submodule and packages it as an APK
+asset.
 
 ## Install and run
 
