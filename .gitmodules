@@ -1,3 +1,6 @@
 [submodule "third_party/scrcpy"]
 	path = third_party/scrcpy
 	url = https://github.com/Genymobile/scrcpy.git
+[submodule "third_party/adb_client"]
+	path = third_party/adb_client
+	url = https://github.com/cocool97/adb_client.git
