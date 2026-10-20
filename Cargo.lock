@@ -108,8 +108,11 @@ version = "0.1.0"
 dependencies = [
  "adb_client",
  "android_logger",
+ "base64 0.22.1",
  "eframe",
  "log",
+ "ndk",
+ "rsa",
  "winit",
 ]
 
