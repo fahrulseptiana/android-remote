@@ -3,6 +3,10 @@
 #[cfg(target_os = "android")]
 mod adb;
 mod app;
+#[cfg(target_os = "android")]
+mod decoder;
+#[cfg(target_os = "android")]
+mod session;
 
 #[cfg(target_os = "android")]
 use winit::platform::android::activity::AndroidApp;

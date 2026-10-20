@@ -1,7 +1,7 @@
-//! Minimal ADB-over-TCP client.
+//! Minimal multiplexed ADB-over-TCP client.
 //!
-//! Only what the remote frontend needs: public-key authentication, opening a
-//! device service (shell or `localabstract`), and streaming bytes over it.
+//! One TCP connection carries every service (shell, sync, local sockets), so
+//! the target only has to authorize this app's key once.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rsa::{
@@ -11,11 +11,17 @@ use rsa::{
     traits::PublicKeyParts,
 };
 use std::{
+    collections::HashMap,
     fs, io,
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     path::Path,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+        mpsc,
+    },
+    thread,
     time::Duration,
 };
 
@@ -31,7 +37,7 @@ const AUTH_TOKEN: u32 = 1;
 const AUTH_PUBLIC_KEY: u32 = 3;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 static NEXT_LOCAL_ID: AtomicU32 = AtomicU32::new(0x1000_0000);
@@ -43,30 +49,160 @@ struct Message {
     payload: Vec<u8>,
 }
 
-/// An open ADB service stream.
-#[derive(Debug)]
+struct StreamState {
+    remote_id: Option<u32>,
+    open_tx: Option<mpsc::SyncSender<io::Result<u32>>>,
+    data_tx: mpsc::Sender<Vec<u8>>,
+    ack_tx: mpsc::Sender<()>,
+}
+
+#[derive(Default)]
+struct ConnectionState {
+    streams: HashMap<u32, StreamState>,
+}
+
+/// A single authenticated ADB transport shared by all streams.
+pub struct AdbConnection {
+    writer: Arc<Mutex<TcpStream>>,
+    state: Arc<Mutex<ConnectionState>>,
+    max_payload: usize,
+}
+
+impl AdbConnection {
+    pub fn connect(addr: SocketAddr, public_key: &[u8]) -> io::Result<Arc<Self>> {
+        let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(Some(AUTH_TIMEOUT))?;
+        stream.set_write_timeout(Some(IO_TIMEOUT))?;
+
+        let mut payload = b"host::".to_vec();
+        payload.push(0);
+        send_message(&mut stream, A_CNXN, 0x0100_0000, 1_048_576, &payload)?;
+
+        let mut key_sent = false;
+        let max_payload = loop {
+            let msg = read_message(&mut stream)?;
+            match msg.command {
+                A_AUTH if msg.arg0 == AUTH_TOKEN => {
+                    if key_sent {
+                        // The target is waiting for the user to approve this key.
+                        // Never resend it: that would create a new prompt each time.
+                        thread::sleep(Duration::from_millis(200));
+                    } else {
+                        send_message(&mut stream, A_AUTH, AUTH_PUBLIC_KEY, 0, public_key)?;
+                        key_sent = true;
+                    }
+                }
+                A_CNXN => break (msg.arg1.max(4096) as usize).min(1_048_576),
+                A_STLS => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "target requires TLS ADB",
+                    ));
+                }
+                _ => {
+                    return Err(io::Error::other(format!(
+                        "unexpected ADB command 0x{:08x} during handshake",
+                        msg.command
+                    )));
+                }
+            }
+        };
+
+        stream.set_read_timeout(None)?;
+        let reader = stream.try_clone()?;
+        let writer = Arc::new(Mutex::new(stream));
+        let state = Arc::new(Mutex::new(ConnectionState::default()));
+
+        let reader_state = Arc::clone(&state);
+        let reader_writer = Arc::clone(&writer);
+        thread::spawn(move || reader_loop(reader, reader_writer, reader_state));
+
+        Ok(Arc::new(Self {
+            writer,
+            state,
+            max_payload,
+        }))
+    }
+
+    pub fn open(self: &Arc<Self>, service: &str) -> io::Result<AdbStream> {
+        let local_id = NEXT_LOCAL_ID.fetch_add(1, Ordering::Relaxed);
+        let (data_tx, data_rx) = mpsc::channel();
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let (open_tx, open_rx) = mpsc::sync_channel(1);
+
+        self.state.lock().unwrap().streams.insert(
+            local_id,
+            StreamState {
+                remote_id: None,
+                open_tx: Some(open_tx),
+                data_tx,
+                ack_tx,
+            },
+        );
+
+        let mut service = service.as_bytes().to_vec();
+        service.push(0);
+        {
+            let mut writer = self.writer.lock().unwrap();
+            if let Err(error) = send_message(&mut writer, A_OPEN, local_id, 0, &service) {
+                self.state.lock().unwrap().streams.remove(&local_id);
+                return Err(error);
+            }
+        }
+
+        match open_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(remote_id)) => Ok(AdbStream {
+                connection: Arc::clone(self),
+                local_id,
+                remote_id,
+                data_rx,
+                ack_rx,
+                pending: Vec::new(),
+                pending_pos: 0,
+                read_timeout: None,
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                self.state.lock().unwrap().streams.remove(&local_id);
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out opening ADB service",
+                ))
+            }
+        }
+    }
+
+    pub fn shutdown(&self) {
+        if let Ok(writer) = self.writer.lock() {
+            let _ = writer.shutdown(Shutdown::Both);
+        }
+        self.state.lock().unwrap().streams.clear();
+    }
+
+    fn close_stream(&self, local_id: u32, remote_id: u32) {
+        self.state.lock().unwrap().streams.remove(&local_id);
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = send_message(&mut writer, A_CLSE, local_id, remote_id, &[]);
+        }
+    }
+}
+
+/// A byte stream for one ADB service.
 pub struct AdbStream {
-    stream: TcpStream,
+    connection: Arc<AdbConnection>,
     local_id: u32,
     remote_id: u32,
-    max_payload: usize,
+    data_rx: mpsc::Receiver<Vec<u8>>,
+    ack_rx: mpsc::Receiver<()>,
     pending: Vec<u8>,
     pending_pos: usize,
+    read_timeout: Option<Duration>,
 }
 
 impl AdbStream {
-    /// Interrupt pending reads and writes.
-    pub fn shutdown(&self) {
-        let _ = self.stream.shutdown(Shutdown::Both);
-    }
-
-    /// Set the timeout used while waiting for read progress.
-    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.stream.set_read_timeout(timeout)
-    }
-
-    fn send_okay(&mut self) -> io::Result<()> {
-        send_message(&mut self.stream, A_OKAY, self.local_id, self.remote_id, &[])
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) {
+        self.read_timeout = timeout;
     }
 }
 
@@ -76,36 +212,29 @@ impl Read for AdbStream {
             return Ok(0);
         }
 
-        if self.pending_pos < self.pending.len() {
-            let available = &self.pending[self.pending_pos..];
-            let len = available.len().min(buf.len());
-            buf[..len].copy_from_slice(&available[..len]);
-            self.pending_pos += len;
-            return Ok(len);
+        while self.pending_pos >= self.pending.len() {
+            let chunk = match self.read_timeout {
+                Some(timeout) => match self.data_rx.recv_timeout(timeout) {
+                    Ok(chunk) => chunk,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+                },
+                None => match self.data_rx.recv() {
+                    Ok(chunk) => chunk,
+                    Err(_) => return Ok(0),
+                },
+            };
+            self.pending = chunk;
+            self.pending_pos = 0;
         }
 
-        loop {
-            let msg = read_message(&mut self.stream)?;
-            match msg.command {
-                A_WRTE => {
-                    self.send_okay()?;
-                    self.pending = msg.payload;
-                    self.pending_pos = 0;
-                    if self.pending.is_empty() {
-                        return Ok(0);
-                    }
-                    return self.read(buf);
-                }
-                A_OKAY => {}
-                A_CLSE => return Ok(0),
-                _ => {
-                    return Err(io::Error::other(format!(
-                        "unexpected ADB command 0x{:08x}",
-                        msg.command
-                    )));
-                }
-            }
-        }
+        let available = &self.pending[self.pending_pos..];
+        let len = available.len().min(buf.len());
+        buf[..len].copy_from_slice(&available[..len]);
+        self.pending_pos += len;
+        Ok(len)
     }
 }
 
@@ -115,37 +244,88 @@ impl Write for AdbStream {
             return Ok(0);
         }
 
-        let len = buf.len().min(self.max_payload);
-        send_message(
-            &mut self.stream,
-            A_WRTE,
-            self.local_id,
-            self.remote_id,
-            &buf[..len],
-        )?;
+        let len = buf.len().min(self.connection.max_payload);
+        {
+            let mut writer = self.connection.writer.lock().unwrap();
+            send_message(
+                &mut writer,
+                A_WRTE,
+                self.local_id,
+                self.remote_id,
+                &buf[..len],
+            )?;
+        }
 
-        loop {
-            let msg = read_message(&mut self.stream)?;
-            match msg.command {
-                A_OKAY => return Ok(len),
-                A_WRTE => {
-                    self.send_okay()?;
-                    self.pending.extend_from_slice(&msg.payload);
-                }
-                A_CLSE => return Err(io::Error::from(io::ErrorKind::BrokenPipe)),
-                _ => {}
-            }
+        match self.ack_rx.recv_timeout(IO_TIMEOUT) {
+            Ok(()) => Ok(len),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out writing to ADB service",
+            )),
         }
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
+        Ok(())
     }
 }
 
+impl Drop for AdbStream {
+    fn drop(&mut self) {
+        self.connection.close_stream(self.local_id, self.remote_id);
+    }
+}
+
+fn reader_loop(
+    mut reader: TcpStream,
+    writer: Arc<Mutex<TcpStream>>,
+    state: Arc<Mutex<ConnectionState>>,
+) {
+    while let Ok(message) = read_message(&mut reader) {
+        let local_id = message.arg1;
+        match message.command {
+            A_OKAY => {
+                let mut streams = state.lock().unwrap();
+                if let Some(stream) = streams.streams.get_mut(&local_id) {
+                    if stream.remote_id.is_none() {
+                        stream.remote_id = Some(message.arg0);
+                        if let Some(open_tx) = stream.open_tx.take() {
+                            let _ = open_tx.send(Ok(message.arg0));
+                        }
+                    } else {
+                        let _ = stream.ack_tx.send(());
+                    }
+                }
+            }
+            A_WRTE => {
+                let remote_id = message.arg0;
+                if let Ok(mut writer) = writer.lock() {
+                    let _ = send_message(&mut writer, A_OKAY, local_id, remote_id, &[]);
+                }
+                let streams = state.lock().unwrap();
+                if let Some(stream) = streams.streams.get(&local_id) {
+                    let _ = stream.data_tx.send(message.payload);
+                }
+            }
+            A_CLSE => {
+                let mut streams = state.lock().unwrap();
+                if let Some(stream) = streams.streams.remove(&local_id)
+                    && let Some(open_tx) = stream.open_tx
+                {
+                    let _ = open_tx.send(Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "device refused ADB service",
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    state.lock().unwrap().streams.clear();
+}
+
 /// Load the app's ADB key, generating and persisting it on first use.
-///
-/// Returns the Android-encoded public key blob expected by `AUTH`.
 pub fn ensure_public_key(path: &Path) -> io::Result<Vec<u8>> {
     if !path.exists() {
         if let Some(parent) = path.parent() {
@@ -162,68 +342,54 @@ pub fn ensure_public_key(path: &Path) -> io::Result<Vec<u8>> {
     Ok(android_public_key(&key))
 }
 
-/// Connect to `adbd` and open a service such as `shell:...` or
-/// `localabstract:...`.
-pub fn open(addr: SocketAddr, public_key: &[u8], service: &str) -> io::Result<AdbStream> {
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(AUTH_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+/// Push a file through the ADB sync service.
+pub fn push(connection: &Arc<AdbConnection>, remote_path: &str, data: &[u8]) -> io::Result<()> {
+    let mut sync = connection.open("sync:")?;
+    sync.set_read_timeout(Some(IO_TIMEOUT));
 
-    let mut payload = b"host::".to_vec();
-    payload.push(0);
-    send_message(&mut stream, A_CNXN, 0x0100_0000, 1_048_576, &payload)?;
+    // Android 16's sync service expects the v1 "path,mode" spec form.
+    let spec = format!("{remote_path},0644");
+    let mut send = Vec::with_capacity(8 + spec.len());
+    send.extend_from_slice(b"SEND");
+    send.extend_from_slice(&(spec.len() as u32).to_le_bytes());
+    send.extend_from_slice(spec.as_bytes());
+    sync.write_all(&send)?;
 
-    let max_payload = loop {
-        let msg = read_message(&mut stream)?;
-        match msg.command {
-            A_AUTH if msg.arg0 == AUTH_TOKEN => {
-                send_message(&mut stream, A_AUTH, AUTH_PUBLIC_KEY, 0, public_key)?;
-            }
-            A_CNXN => break (msg.arg1.max(4096) as usize).min(1_048_576),
-            A_STLS => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "target requires TLS ADB",
-                ));
-            }
-            _ => {
-                return Err(io::Error::other(format!(
-                    "unexpected ADB command 0x{:08x} during handshake",
-                    msg.command
-                )));
-            }
-        }
-    };
+    for chunk in data.chunks(64 * 1024) {
+        let mut packet = Vec::with_capacity(8 + chunk.len());
+        packet.extend_from_slice(b"DATA");
+        packet.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        packet.extend_from_slice(chunk);
+        sync.write_all(&packet)?;
+    }
 
-    let local_id = NEXT_LOCAL_ID.fetch_add(1, Ordering::Relaxed);
-    let mut service = service.as_bytes().to_vec();
-    service.push(0);
-    send_message(&mut stream, A_OPEN, local_id, 0, &service)?;
+    let mut done = Vec::with_capacity(8);
+    done.extend_from_slice(b"DONE");
+    done.extend_from_slice(&0u32.to_le_bytes());
+    sync.write_all(&done)?;
+    expect_sync_okay(&mut sync)?;
+    Ok(())
+}
 
-    let remote_id = loop {
-        let msg = read_message(&mut stream)?;
-        match msg.command {
-            A_OKAY => break msg.arg0,
-            A_CLSE => {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionRefused,
-                    "device refused ADB service",
-                ));
-            }
-            _ => {}
-        }
-    };
-
-    stream.set_read_timeout(None)?;
-    Ok(AdbStream {
-        stream,
-        local_id,
-        remote_id,
-        max_payload,
-        pending: Vec::new(),
-        pending_pos: 0,
-    })
+fn expect_sync_okay(stream: &mut AdbStream) -> io::Result<()> {
+    let mut response = [0u8; 8];
+    stream.read_exact(&mut response)?;
+    if &response[0..4] == b"OKAY" {
+        return Ok(());
+    }
+    if &response[0..4] == b"FAIL" {
+        let len = u32::from_le_bytes(response[4..8].try_into().unwrap()) as usize;
+        let mut message = vec![0u8; len];
+        stream.read_exact(&mut message)?;
+        return Err(io::Error::other(format!(
+            "ADB push failed: {}",
+            String::from_utf8_lossy(&message)
+        )));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid ADB sync response",
+    ))
 }
 
 fn read_message(stream: &mut TcpStream) -> io::Result<Message> {
