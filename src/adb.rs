@@ -5,11 +5,12 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rsa::{
-    BigUint, RsaPrivateKey,
+    BigUint, Pkcs1v15Sign, RsaPrivateKey,
     pkcs8::{DecodePrivateKey, EncodePrivateKey, LineEnding},
     rand_core::OsRng,
     traits::PublicKeyParts,
 };
+use sha1::Sha1;
 use std::{
     collections::HashMap,
     fs, io,
@@ -34,10 +35,10 @@ const A_WRTE: u32 = 0x4554_5257;
 const A_STLS: u32 = 0x534c_5453;
 
 const AUTH_TOKEN: u32 = 1;
+const AUTH_SIGNATURE: u32 = 2;
 const AUTH_PUBLIC_KEY: u32 = 3;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const AUTH_TIMEOUT: Duration = Duration::from_secs(60);
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 static NEXT_LOCAL_ID: AtomicU32 = AtomicU32::new(0x1000_0000);
@@ -61,6 +62,12 @@ struct ConnectionState {
     streams: HashMap<u32, StreamState>,
 }
 
+/// The ADB key pair used for authentication.
+pub struct AdbKey {
+    private: RsaPrivateKey,
+    pub public: Vec<u8>,
+}
+
 /// A single authenticated ADB transport shared by all streams.
 pub struct AdbConnection {
     writer: Arc<Mutex<TcpStream>>,
@@ -69,28 +76,50 @@ pub struct AdbConnection {
 }
 
 impl AdbConnection {
-    pub fn connect(addr: SocketAddr, public_key: &[u8]) -> io::Result<Arc<Self>> {
+    pub fn connect(
+        addr: SocketAddr,
+        key: &AdbKey,
+        auth_socket: &Arc<Mutex<Option<TcpStream>>>,
+        stop: &std::sync::atomic::AtomicBool,
+    ) -> io::Result<Arc<Self>> {
         let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
         stream.set_nodelay(true)?;
-        stream.set_read_timeout(Some(AUTH_TIMEOUT))?;
+        stream.set_read_timeout(None)?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
+
+        if let Ok(mut slot) = auth_socket.lock() {
+            *slot = Some(stream.try_clone()?);
+        }
 
         let mut payload = b"host::".to_vec();
         payload.push(0);
         send_message(&mut stream, A_CNXN, 0x0100_0000, 1_048_576, &payload)?;
 
+        let mut signature_sent = false;
         let mut key_sent = false;
         let max_payload = loop {
+            if stop.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "connection cancelled",
+                ));
+            }
             let msg = read_message(&mut stream)?;
             match msg.command {
                 A_AUTH if msg.arg0 == AUTH_TOKEN => {
-                    if key_sent {
-                        // The target is waiting for the user to approve this key.
-                        // Never resend it: that would create a new prompt each time.
-                        thread::sleep(Duration::from_millis(200));
-                    } else {
-                        send_message(&mut stream, A_AUTH, AUTH_PUBLIC_KEY, 0, public_key)?;
+                    if !signature_sent {
+                        let signature = key
+                            .private
+                            .sign(Pkcs1v15Sign::new::<Sha1>(), &msg.payload)
+                            .map_err(io::Error::other)?;
+                        send_message(&mut stream, A_AUTH, AUTH_SIGNATURE, 0, &signature)?;
+                        signature_sent = true;
+                    } else if !key_sent {
+                        send_message(&mut stream, A_AUTH, AUTH_PUBLIC_KEY, 0, &key.public)?;
                         key_sent = true;
+                    } else {
+                        // The target is waiting for the user to approve this key.
+                        thread::sleep(Duration::from_millis(200));
                     }
                 }
                 A_CNXN => break (msg.arg1.max(4096) as usize).min(1_048_576),
@@ -326,7 +355,7 @@ fn reader_loop(
 }
 
 /// Load the app's ADB key, generating and persisting it on first use.
-pub fn ensure_public_key(path: &Path) -> io::Result<Vec<u8>> {
+pub fn ensure_key(path: &Path) -> io::Result<AdbKey> {
     if !path.exists() {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -339,7 +368,13 @@ pub fn ensure_public_key(path: &Path) -> io::Result<Vec<u8>> {
 
     let pem = fs::read_to_string(path)?;
     let key = RsaPrivateKey::from_pkcs8_pem(&pem).map_err(io::Error::other)?;
-    Ok(android_public_key(&key))
+    let username =
+        read_public_key_username(path, &key).unwrap_or_else(|| "arem@android".to_owned());
+    let public = android_public_key(&key, &username);
+    Ok(AdbKey {
+        private: key,
+        public,
+    })
 }
 
 /// Push a file through the ADB sync service.
@@ -473,7 +508,25 @@ const fn crc32_table() -> [u32; 256] {
     table
 }
 
-fn android_public_key(key: &RsaPrivateKey) -> Vec<u8> {
+fn read_public_key_username(path: &Path, key: &RsaPrivateKey) -> Option<String> {
+    let public_path = path.with_extension("pub");
+    let contents = fs::read_to_string(public_path).ok()?;
+    let (encoded, username) = contents.trim().split_once(' ')?;
+    if encoded != STANDARD.encode(android_public_key_blob(key)) {
+        return None;
+    }
+    Some(username.to_owned())
+}
+
+fn android_public_key(key: &RsaPrivateKey, username: &str) -> Vec<u8> {
+    format!(
+        "{} {username}",
+        STANDARD.encode(android_public_key_blob(key))
+    )
+    .into_bytes()
+}
+
+fn android_public_key_blob(key: &RsaPrivateKey) -> Vec<u8> {
     const MODULUS_BYTES: usize = 256;
 
     let modulus = fixed_le(key.n(), MODULUS_BYTES);
@@ -497,8 +550,7 @@ fn android_public_key(key: &RsaPrivateKey) -> Vec<u8> {
     blob.extend_from_slice(&modulus);
     blob.extend_from_slice(&rr);
     blob.extend_from_slice(&exponent.to_le_bytes());
-
-    format!("{} arem@android", STANDARD.encode(blob)).into_bytes()
+    blob
 }
 
 fn fixed_le(value: &BigUint, len: usize) -> Vec<u8> {

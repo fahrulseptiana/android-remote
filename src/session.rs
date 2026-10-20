@@ -47,6 +47,7 @@ pub struct Session {
     pub frames: mpsc::Receiver<VideoFrame>,
     control: mpsc::Sender<ControlEvent>,
     stop: Arc<AtomicBool>,
+    auth_socket: Arc<Mutex<Option<std::net::TcpStream>>>,
     connection: Arc<Mutex<Option<Arc<adb::AdbConnection>>>>,
 }
 
@@ -56,9 +57,11 @@ impl Session {
         let (frame_tx, frame_rx) = mpsc::sync_channel(1);
         let (control_tx, control_rx) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
+        let auth_socket = Arc::new(Mutex::new(None));
         let connection = Arc::new(Mutex::new(None));
 
         let worker_stop = Arc::clone(&stop);
+        let worker_auth_socket = Arc::clone(&auth_socket);
         let worker_connection = Arc::clone(&connection);
         thread::spawn(move || {
             let result = run(
@@ -69,6 +72,7 @@ impl Session {
                 &frame_tx,
                 control_rx,
                 &worker_stop,
+                &worker_auth_socket,
                 &worker_connection,
                 &ctx,
             );
@@ -88,6 +92,7 @@ impl Session {
             frames: frame_rx,
             control: control_tx,
             stop,
+            auth_socket,
             connection,
         }
     }
@@ -106,6 +111,9 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(socket) = self.auth_socket.lock().unwrap().take() {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
         if let Some(connection) = self.connection.lock().unwrap().take() {
             connection.shutdown();
         }
@@ -121,6 +129,7 @@ fn run(
     frames: &mpsc::SyncSender<VideoFrame>,
     control_rx: mpsc::Receiver<ControlEvent>,
     stop: &Arc<AtomicBool>,
+    auth_socket: &Arc<Mutex<Option<std::net::TcpStream>>>,
     connection_slot: &Arc<Mutex<Option<Arc<adb::AdbConnection>>>>,
     ctx: &egui::Context,
 ) -> Result<(), String> {
@@ -130,8 +139,8 @@ fn run(
         "Connecting... approve the target prompt and check \"Always allow\".",
     );
 
-    let public_key = adb::ensure_public_key(key_path).map_err(|error| error.to_string())?;
-    let connection = adb::AdbConnection::connect(address, &public_key)
+    let key = adb::ensure_key(key_path).map_err(|error| error.to_string())?;
+    let connection = adb::AdbConnection::connect(address, &key, auth_socket, stop)
         .map_err(|error| format!("ADB connection failed: {error}"))?;
 
     {
