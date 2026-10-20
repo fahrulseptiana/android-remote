@@ -1,7 +1,7 @@
 # AREM
 
-A native Android remote built with Rust, [egui], and [eframe]. The app contains
-no Java or Kotlin sources: Android starts the Rust `cdylib` through the
+A native Android remote built with Rust, [egui], and [eframe]. The app itself
+contains no Java or Kotlin sources: Android starts the Rust `cdylib` through the
 framework `NativeActivity`.
 
 - Package ID: `id.fahrul.remote`
@@ -20,6 +20,7 @@ framework `NativeActivity`.
 - `ANDROID_HOME` set, or `sdk.dir` in `android/local.properties`
 
 ```sh
+git submodule update --init --recursive
 rustup target add aarch64-linux-android x86_64-linux-android
 cargo install cargo-ndk
 ```
@@ -57,12 +58,20 @@ The UI can also run in a native window while developing:
 cargo run
 ```
 
+## Third-party components
+
+- [`third_party/scrcpy`](third_party/scrcpy) — scrcpy v5.0.1 (Apache-2.0).
+  Provides the device-side `scrcpy-server` and the protocol reference.
+- [`third_party/adb_client`](third_party/adb_client) — adb_client v3.2.3 (MIT).
+  Pure Rust ADB client used for direct TCP/IP connections to `adbd`.
+
 ## Layout
 
 ```text
 src/lib.rs        application UI, Android entry point, safe-area handling
 src/main.rs       desktop preview entry point
 android/          Gradle project, manifest, and resources
+third_party/      pinned scrcpy and adb_client submodules
 ```
 
 [egui]: https://github.com/emilk/egui
