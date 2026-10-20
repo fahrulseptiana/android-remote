@@ -1,0 +1,14 @@
+# Rust
+/target/
+
+# Android
+/android/.gradle/
+/android/.idea/
+/android/build/
+/android/app/build/
+/android/local.properties
+
+# Tooling
+*.iml
+.DS_Store
+Thumbs.db
