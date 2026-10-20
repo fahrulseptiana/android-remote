@@ -63,12 +63,12 @@ impl AremApp {
                 points.min(i8::MAX as i32) as i8
             };
 
-            return egui::Margin {
+            egui::Margin {
                 left: to_points(rect.left),
                 right: to_points(screen.x as i32 - rect.right),
                 top: to_points(rect.top),
                 bottom: to_points(screen.y as i32 - rect.bottom),
-            };
+            }
         }
 
         #[cfg(not(target_os = "android"))]
