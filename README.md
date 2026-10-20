@@ -50,6 +50,20 @@ Follow Rust logs with:
 adb logcat -s AREM:V
 ```
 
+## Usage
+
+1. Enable ADB over TCP on the target (for example `adb tcpip 5555`) and make
+   sure the tablet can reach the target's IP.
+2. Enter the target address in AREM and tap **Connect**.
+3. On the first connection, approve the debugging prompt on the target and check
+   **Always allow from this computer**. AREM uses a single multiplexed ADB
+   connection, so it asks at most once per connection.
+4. The target screen fills the app. Tap or drag to control it. The overlay
+   provides **Back**, **Recents**, and **Disconnect**.
+
+Video is capped at 960 px / 30 fps for smooth decoding on mobile hardware.
+Only ADB over TCP/IP is supported; USB/OTG is intentionally out of scope.
+
 ## Desktop preview
 
 The UI can also run in a native window while developing:
@@ -62,13 +76,19 @@ cargo run
 
 - [`third_party/scrcpy`](third_party/scrcpy) — scrcpy v5.0.1 (Apache-2.0).
   Provides the device-side `scrcpy-server` and the protocol reference.
-- [`third_party/adb_client`](third_party/adb_client) — adb_client v3.2.3 (MIT).
-  Pure Rust ADB client used for direct TCP/IP connections to `adbd`.
+- [`third_party/adb_client`](third_party/adb_client) - adb_client v3.2.3 (MIT).
+  Kept as a protocol reference. Its public API does not expose raw
+  `localabstract:` services, so AREM uses a small first-party multiplexed ADB
+  client to keep all scrcpy streams on one authorized connection.
 
 ## Layout
 
 ```text
-src/lib.rs        application UI, Android entry point, safe-area handling
+src/app.rs        connection UI, fullscreen remote, touch mapping
+src/adb.rs        multiplexed ADB-over-TCP client and ADB key handling
+src/decoder.rs    MediaCodec H.264 decoder to RGBA
+src/session.rs    scrcpy-server setup, video/control streams
+src/lib.rs        Android entry point and safe-area handling
 src/main.rs       desktop preview entry point
 android/          Gradle project, manifest, and resources
 third_party/      pinned scrcpy and adb_client submodules
