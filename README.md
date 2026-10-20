@@ -56,8 +56,8 @@ adb logcat -s AREM:V
    sure the tablet can reach the target's IP.
 2. Enter the target address in AREM and tap **Connect**.
 3. On the first connection, approve the debugging prompt on the target and check
-   **Always allow from this computer**. AREM uses a single multiplexed ADB
-   connection, so it asks at most once per connection.
+   **Always allow from this computer**. AREM stores its ADB key and signs later
+   authentication challenges, so reconnecting does not show the prompt again.
 4. The target screen fills the app. Tap or drag to control it. The overlay
    provides **Back**, **Recents**, and **Disconnect**.
 
