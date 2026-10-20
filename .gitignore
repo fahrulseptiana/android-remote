@@ -8,6 +8,9 @@
 /android/app/build/
 /android/local.properties
 
+# Generated from third_party/scrcpy at build time
+/android/app/src/main/assets/scrcpy-server.jar
+
 # Tooling
 *.iml
 .DS_Store
